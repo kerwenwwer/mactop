@@ -55,6 +55,12 @@ type EventThrottler struct {
 	C chan struct{}
 }
 
+type BatteryMetrics struct {
+	Percentage    int
+	TimeRemaining string
+	IsCharging    bool
+}
+
 func NewEventThrottler(gracePeriod time.Duration) *EventThrottler {
 	return &EventThrottler{
 		timer:       nil,
@@ -89,6 +95,7 @@ var (
 	currentGridLayout                                         = "default"
 	showHelp                                                  = false
 	updateInterval                                            = 1000
+	batteryGauge                                              *w.Gauge
 )
 
 var (
@@ -109,6 +116,9 @@ func setupUI() {
 	modelText.Title = "Apple Silicon"
 	helpText.Title = "mactop help menu"
 	modelName, ok := appleSiliconModel["name"].(string)
+	batteryGauge = w.NewGauge()
+	batteryGauge.Title = "Battery"
+	batteryGauge.BarColor = ui.ColorYellow
 	if !ok {
 		modelName = "Unknown Model"
 	}
@@ -173,11 +183,12 @@ func setupGrid() {
 			ui.NewCol(1.0/2, ui.NewRow(1.0/2, cpu1Gauge), ui.NewCol(1.0, ui.NewRow(1.0, cpu2Gauge))),
 			ui.NewCol(1.0/2, ui.NewRow(1.0/2, gpuGauge), ui.NewCol(1.0, ui.NewRow(1.0, aneGauge))), // ui.NewCol(1.0/2, ui.NewRow(1.0, ProcessInfo)), // ProcessInfo spans this entire column
 		),
-		ui.NewRow(1.0/4,
-			ui.NewCol(1.0/6, modelText),
-			ui.NewCol(1.0/3, NetworkInfo),
-			ui.NewCol(1.0/4, PowerChart),
-			ui.NewCol(1.0/4, TotalPowerChart),
+		ui.NewRow(1.0/5,
+			ui.NewCol(1.0/5, modelText),
+			ui.NewCol(1.0/4, NetworkInfo),
+			ui.NewCol(1.0/5, PowerChart),
+			ui.NewCol(1.0/5, TotalPowerChart),
+			ui.NewCol(1.0/7, batteryGauge),
 		),
 		ui.NewRow(1.0/4,
 			ui.NewCol(1.0, memoryGauge),
@@ -375,13 +386,14 @@ func main() {
 	gpuMetricsChan := make(chan GPUMetrics)
 	netdiskMetricsChan := make(chan NetDiskMetrics)
 	processMetricsChan := make(chan []ProcessMetrics)
+	batteryMetricsChan := make(chan BatteryMetrics)
 
 	done := make(chan struct{})
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 
 	appleSiliconModel := getSOCInfo()
-	go collectMetrics(done, cpuMetricsChan, gpuMetricsChan, netdiskMetricsChan, processMetricsChan, appleSiliconModel["name"].(string))
+	go collectMetrics(done, cpuMetricsChan, gpuMetricsChan, netdiskMetricsChan, processMetricsChan, batteryMetricsChan, appleSiliconModel["name"].(string))
 	lastUpdateTime = time.Now()
 	needRender := NewEventThrottler(time.Duration(updateInterval/2) * time.Millisecond)
 	go func() {
@@ -402,6 +414,9 @@ func main() {
 				needRender.Notify()
 			case <-needRender.C:
 				ui.Render(grid)
+			case batteryMetrics := <-batteryMetricsChan:
+				updateBatteryUI(batteryMetrics)
+				needRender.Notify()
 			case <-quit:
 				close(done)
 				ui.Close()
@@ -465,7 +480,7 @@ func setupLogfile() (*os.File, error) {
 	return logfile, nil
 }
 
-func collectMetrics(done chan struct{}, cpumetricsChan chan CPUMetrics, gpumetricsChan chan GPUMetrics, netdiskMetricsChan chan NetDiskMetrics, processMetricsChan chan []ProcessMetrics, modelName string) {
+func collectMetrics(done chan struct{}, cpumetricsChan chan CPUMetrics, gpumetricsChan chan GPUMetrics, netdiskMetricsChan chan NetDiskMetrics, processMetricsChan chan []ProcessMetrics, batteryMetricsChan chan BatteryMetrics, modelName string) {
 	var cpuMetrics CPUMetrics
 	var gpuMetrics GPUMetrics
 	var netdiskMetrics NetDiskMetrics
@@ -499,6 +514,10 @@ func collectMetrics(done chan struct{}, cpumetricsChan chan CPUMetrics, gpumetri
 					netdiskMetricsChan <- netdiskMetrics
 					processMetricsChan <- processMetrics
 
+					if time.Now().Unix()%5 == 0 {
+						batteryMetrics := getBatteryMetrics()
+						batteryMetricsChan <- batteryMetrics
+					}
 				} else {
 					if err := scanner.Err(); err != nil {
 						stderrLogger.Printf("error during scan: %v", err)
@@ -991,4 +1010,57 @@ func getGPUCores() string {
 		}
 	}
 	return "?"
+}
+
+func getBatteryMetrics() BatteryMetrics {
+	cmd := exec.Command("pmset", "-g", "batt")
+	output, err := cmd.Output()
+	if err != nil {
+		stderrLogger.Printf("Error getting battery info: %v", err)
+		return BatteryMetrics{}
+	}
+
+	lines := strings.Split(string(output), "\n")
+	if len(lines) < 2 {
+		return BatteryMetrics{}
+	}
+
+	batteryInfo := lines[1]
+	percentageRegex := regexp.MustCompile(`(\d+)%`)
+	timeRegex := regexp.MustCompile(`(\d+:\d+) remaining`)
+	chargingRegex := regexp.MustCompile(`; charging`)
+
+	percentageMatch := percentageRegex.FindStringSubmatch(batteryInfo)
+	timeMatch := timeRegex.FindStringSubmatch(batteryInfo)
+	isCharging := chargingRegex.MatchString(batteryInfo)
+
+	var percentage int
+	var timeRemaining string
+
+	if len(percentageMatch) > 1 {
+		percentage, _ = strconv.Atoi(percentageMatch[1])
+	}
+
+	if len(timeMatch) > 1 {
+		timeRemaining = timeMatch[1]
+	} else if isCharging {
+		timeRemaining = "Charging"
+	} else {
+		timeRemaining = "Unknown"
+	}
+
+	return BatteryMetrics{
+		Percentage:    percentage,
+		TimeRemaining: timeRemaining,
+		IsCharging:    isCharging,
+	}
+}
+
+func updateBatteryUI(batteryMetrics BatteryMetrics) {
+	batteryGauge.Percent = batteryMetrics.Percentage
+	if batteryMetrics.IsCharging {
+		batteryGauge.Title = fmt.Sprintf("Battery: %d%% (Charging)", batteryMetrics.Percentage)
+	} else {
+		batteryGauge.Title = fmt.Sprintf("Battery: %d%% (%s remaining)", batteryMetrics.Percentage, batteryMetrics.TimeRemaining)
+	}
 }
